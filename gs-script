@@ -1,0 +1,122 @@
+/**
+ * WP CRM LiveOps Notes — Google Apps Script backend (task-list version)
+ *
+ * Each saved note is its own row (never overwritten). Supports:
+ *  - listing all notes for an order (newest first)
+ *  - adding a new note
+ *  - deleting a note
+ *
+ * SETUP:
+ * 1. Open (or create) the Google Sheet you want notes saved into.
+ * 2. Extensions > Apps Script.
+ * 3. Delete any placeholder code, paste this file in.
+ * 4. Deploy > New deployment > type "Web app".
+ *      - Execute as: Me
+ *      - Who has access: Anyone (or "Anyone with the link")
+ * 5. Copy the Web App URL it gives you.
+ * 6. Paste that URL into SHEET_WEBAPP_URL in the Tampermonkey script.
+ *
+ * A tab called "LiveOpsNotes" is created automatically on first save, with
+ * columns: Task ID | Order ID | Note | Author | Timestamp
+ *
+ * NOTE: this replaces the earlier single-note-per-order version. If you
+ * already deployed the old backend, either delete the old "OrderNotes" tab
+ * or just leave it — this script uses a different tab name ("LiveOpsNotes")
+ * so the two won't collide.
+ */
+
+const SHEET_NAME = 'LiveOpsNotes';
+
+const EM_PROJECT_SHEET_NAME = 'em-project';
+const EM_PROJECT_CITY_COL = 4;       // column E (0-indexed)
+const EM_PROJECT_CITY_OWNER_COL = 6; // column G
+const EM_PROJECT_HERO_DRIVER_COL = 7;// column H
+const EM_PROJECT_NOTES_COL = 8;      // column I
+
+function doGet(e) {
+  const action = e.parameter.action;
+  const orderId = e.parameter.orderId;
+
+  if (action === 'cityInfo') {
+    const city = String(e.parameter.city || '').trim().toLowerCase();
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(EM_PROJECT_SHEET_NAME);
+    if (!sheet || !city) return jsonResponse({ found: false });
+
+    const data = sheet.getDataRange().getValues();
+    for (let i = 0; i < data.length; i++) {
+      const rowCity = String(data[i][EM_PROJECT_CITY_COL] || '').trim().toLowerCase();
+      if (rowCity === city) {
+        return jsonResponse({
+          found: true,
+          cityOwner: data[i][EM_PROJECT_CITY_OWNER_COL],
+          heroDriver: data[i][EM_PROJECT_HERO_DRIVER_COL],
+          notes: data[i][EM_PROJECT_NOTES_COL]
+        });
+      }
+    }
+    return jsonResponse({ found: false });
+  }
+
+  if (action === 'list') {
+    const sheet = getSheet();
+    const data = sheet.getDataRange().getValues();
+    const tasks = [];
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][1]) === String(orderId)) {
+        tasks.push({
+          id: data[i][0],
+          note: data[i][2],
+          author: data[i][3],
+          timestamp: data[i][4] ? new Date(data[i][4]).toLocaleString() : ''
+        });
+      }
+    }
+    // newest first
+    tasks.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    return jsonResponse({ tasks });
+  }
+
+  return jsonResponse({ error: 'unknown action' });
+}
+
+function doPost(e) {
+  const body = JSON.parse(e.postData.contents);
+  const sheet = getSheet();
+
+  if (body.action === 'add') {
+    const id = Utilities.getUuid();
+    const now = new Date();
+    sheet.appendRow([id, body.orderId, body.note, body.author || '', now]);
+    return jsonResponse({ ok: true, id, timestamp: now.toLocaleString() });
+  }
+
+  if (body.action === 'delete') {
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === String(body.id)) {
+        sheet.deleteRow(i + 1);
+        return jsonResponse({ ok: true });
+      }
+    }
+    return jsonResponse({ ok: false, error: 'not found' });
+  }
+
+  return jsonResponse({ ok: false, error: 'unknown action' });
+}
+
+function getSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+    sheet.appendRow(['Task ID', 'Order ID', 'Note', 'Author', 'Timestamp']);
+  }
+  return sheet;
+}
+
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
