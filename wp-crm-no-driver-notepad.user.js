@@ -21,20 +21,10 @@
   const SHEET_WEBAPP_URL = 'https://script.google.com/a/macros/welcomepickups.com/s/AKfycbxi1hSJroLQ5hWRlowdoAMQ_-A61EKVio7EJYkYXZC6g6XFso4LGapHzbMMNt9CF5hr/exec';
   const AUTHOR_EMAIL_DOMAIN = 'welcomepickups.com'; // used if the CRM only shows a username, not a full email
 
- // ==UserScript==
-// @name         WP CRM - No Driver Alert + Order Notepad
-// @namespace    local.crm.highlighter
-// @version      5.0
-// @description  Flags rows missing a driver on the index page. Adds a floating notepad on order detail pages that saves notes to a Google Sheet.
-// @match        https://crm.welcomepickups.com/admin/tour_transfers/*
-// @grant        GM_xmlhttpRequest
-// @connect      script.google.com
-// @connect      script.googleusercontent.com
-// @run-at       document-idle
-// @updateURL    PASTE_RAW_GITHUB_URL_HERE
-// @downloadURL  PASTE_RAW_GITHUB_URL_HERE
-// ==/UserScript==
-
+  // Auto-detects the logged-in agent from the "Logout" area in the top bar
+  // (e.g. the "ckalantzis" text shown above the Logout link), and turns it
+  // into an email if it isn't one already. Falls back to 'Unknown agent'
+  // if nothing can be found, so notes are never left completely unlabeled.
   function detectAuthor() {
     const currentUserEl = document.querySelector('#current_user a, #current_user');
     const raw = (currentUserEl?.textContent || '').trim();
