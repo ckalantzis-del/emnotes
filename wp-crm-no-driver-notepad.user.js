@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name         WP CRM - No Driver Alert + Order Notepad
 // @namespace    local.crm.highlighter
-// @version      5.0
-// @description  Flags rows missing a driver on the index page. Adds a floating notepad on order detail pages that saves notes to a Google Sheet.
+// @version      5.1
+// @description  Flags rows missing a driver on the index page. Adds a floating notepad on order detail pages that saves notes to a Google Sheet, plus a "Copy ride info" button.
 // @match        https://crm.welcomepickups.com/admin/tour_transfers/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @run-at       document-idle
-// @updateURL    PASTE_RAW_GITHUB_URL_HERE
-// @downloadURL  PASTE_RAW_GITHUB_URL_HERE
+// @updateURL    https://raw.githubusercontent.com/ckalantzis-del/emnotes/main/wp-crm-no-driver-notepad.user.js
+// @downloadURL  https://raw.githubusercontent.com/ckalantzis-del/emnotes/main/wp-crm-no-driver-notepad.user.js
 // ==/UserScript==
 
 (function () {
@@ -506,6 +507,122 @@
   }
 
   // ============================================================
+  // PART 3 — DETAIL PAGE: "Copy ride info" button
+  // Reads Date / Time / From / To / Pax / Price (provider cost) from the
+  // linked Welcome Order (green logo link) and copies it to the clipboard.
+  // ============================================================
+  function initRideInfoCopier() {
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const CURRENCY = { EUR: '€', USD: '$', GBP: '£' };
+
+    function readRow(doc, key) {
+      const row = doc.querySelector('tr.row-' + key);
+      if (!row || !row.children[1]) return '';
+      const val = row.children[1].textContent.trim().replace(/\s+/g, ' ');
+      return val === 'Empty' ? '' : val;
+    }
+
+    function extract(doc, duration) {
+      // "October 11, 2026 05:00" -> "11/10/2026" + "05:00"
+      const dt = readRow(doc, 'from_datetime');
+      const m = dt.match(/^(\w+)\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}:\d{2})$/);
+      const pad = (n) => String(n).padStart(2, '0');
+      const date = m && MONTHS.includes(m[1])
+        ? pad(m[2]) + '/' + pad(MONTHS.indexOf(m[1]) + 1) + '/' + m[3]
+        : dt;
+      const time = m ? m[4] : '';
+
+      const cost = readRow(doc, 'provider_cost');
+      const cur = readRow(doc, 'currency_code');
+      const price = cost ? String(parseFloat(cost)) + ' ' + (CURRENCY[cur] || cur || '€') : '';
+
+      return [
+        'Date: ' + date,
+        'Time: ' + time,
+        'Duration: ' + (duration || ''),
+        'From: ' + (readRow(doc, 'from_address') || readRow(doc, 'from_location')),
+        'To: ' + (readRow(doc, 'to_address') || readRow(doc, 'service') || readRow(doc, 'title')),
+        'Pax: ' + readRow(doc, 'number_of_passengers'),
+        'Price ' + price,
+      ].join('\n');
+    }
+
+    // The Accept header is required: without it the CRM redirects background requests to the Dashboard
+    const FETCH_OPTS = { credentials: 'same-origin', headers: { Accept: 'text/html,application/xhtml+xml' } };
+
+    async function getText() {
+      const link = document.querySelector('#page_title a[href*="/admin/welcome_orders/"]');
+      if (!link) throw new Error('Could not find the Welcome Order link on this page.');
+      const res = await fetch(link.href, FETCH_OPTS);
+      if (!res.ok) throw new Error('Could not open the order (HTTP ' + res.status + ')');
+      const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+      if (!doc.querySelector('tr.row-from_datetime')) {
+        throw new Error('The order page did not load correctly (got "' + doc.title + '"). Try reloading the page.');
+      }
+
+      // Duration lives on the Service page (the "Service" link on the order page)
+      let duration = '';
+      const serviceLink = doc.querySelector('tr.row-service a[href]');
+      if (serviceLink) {
+        try {
+          const sRes = await fetch(new URL(serviceLink.getAttribute('href'), location.origin).href, FETCH_OPTS);
+          const sDoc = new DOMParser().parseFromString(await sRes.text(), 'text/html');
+          duration = readRow(sDoc, 'duration');
+        } catch (e) { /* leave duration empty if the service page fails */ }
+      }
+      return extract(doc, duration);
+    }
+
+    function showPanel(text) {
+      let box = document.getElementById('wp-ride-info-box');
+      if (!box) {
+        box = document.createElement('div');
+        box.id = 'wp-ride-info-box';
+        Object.assign(box.style, {
+          position: 'fixed', bottom: '20px', right: '20px', zIndex: 99999,
+          background: '#fff', border: `2px solid ${BRAND.emerald}`, borderRadius: '8px',
+          padding: '12px 14px', fontFamily: BRAND.font, fontSize: '13px', lineHeight: '1.5',
+          color: BRAND.graphite, boxShadow: '0 4px 16px rgba(0,0,0,.15)',
+          maxWidth: '420px', whiteSpace: 'pre-wrap'
+        });
+        document.body.appendChild(box);
+      }
+      box.textContent = text;
+      const foot = document.createElement('div');
+      Object.assign(foot.style, { marginTop: '8px', textAlign: 'right', whiteSpace: 'normal' });
+      foot.innerHTML = `<span style="color:${BRAND.emerald}">✓ copied</span> &nbsp; <a href="#">close</a>`;
+      foot.querySelector('a').onclick = (e) => { e.preventDefault(); box.remove(); };
+      box.appendChild(foot);
+    }
+
+    const pageTitle = document.getElementById('page_title');
+    if (!pageTitle || document.getElementById('wp-ride-info-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'wp-ride-info-btn';
+    btn.type = 'button';
+    btn.textContent = 'Copy ride info';
+    Object.assign(btn.style, {
+      marginLeft: '10px', padding: '4px 10px', background: BRAND.emerald, color: BRAND.graphite,
+      border: 'none', borderRadius: '6px', fontSize: '13px', fontWeight: '700',
+      fontFamily: BRAND.font, cursor: 'pointer', verticalAlign: 'middle'
+    });
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      btn.textContent = 'Loading…';
+      try {
+        const text = await getText();
+        GM_setClipboard(text, 'text');
+        showPanel(text);
+      } catch (err) {
+        alert(err.message);
+      }
+      btn.textContent = 'Copy ride info';
+    });
+    pageTitle.appendChild(btn);
+  }
+
+  // ============================================================
   // ROUTER
   // ============================================================
   const isIndexPage = /tour_transfers\/index_v2/.test(location.href);
@@ -513,5 +630,6 @@
     initIndexHighlighter();
   } else {
     initNotepad();
+    initRideInfoCopier();
   }
 })();
