@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         WP CRM - S-Rides Ops Managers (City Highlighter + LiveOps Notes)
 // @namespace    local.crm.highlighter
-// @version      1.0
-// @description  Highlights S-Rides cities + flags missing driver on the index page. Adds the LiveOps Notes + EM Project card on order detail pages.
+// @version      1.5
+// @description  Highlights your own S-Rides cities (from the em-project sheet) + flags missing driver on the index page. Adds the LiveOps Notes + EM Project card and a "Copy ride info" button on order detail pages.
 // @match        https://crm.welcomepickups.com/admin/tour_transfers/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_setClipboard
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @run-at       document-idle
@@ -37,24 +40,21 @@
 
   const AUTHOR_NAME = detectAuthor();
 
+  // Logged-in CRM email → name as written in the "City Owner" column of the
+  // em-project tab. Matching is case-insensitive and partial, so "Stavros"
+  // also matches an owner cell like "Stavros P." Add one line per person.
+  const OWNER_BY_EMAIL = {
+    'ckalantzis@welcomepickups.com': 'Christophoros',
+    'sperros@welcomepickups.com': 'Stavros',
+  };
+  const MY_OWNER_NAME = OWNER_BY_EMAIL[AUTHOR_NAME.toLowerCase()] || null;
+
   // ============================================================
   // PART 1 — INDEX PAGE: city highlighter + smart driver alert
-  // (unchanged from the original S-Rides ops script)
+  // Cities come from the em-project tab (via the Apps Script `cities`
+  // action), filtered to the logged-in person's own cities.
   // ============================================================
   function initIndexHighlighter() {
-
-    const MY_CITIES = new Set([
-      "Alicante","Amsterdam","Athens","Bali","Bangkok","Barcelona","Berlin","Brussels",
-      "Bucharest","Buenos Aires","Cape Town","Cyprus","Dubai","Faro","Florence",
-      "Gran Canaria","Helsinki","Hong Kong","Kefalonia","Lanzarote","Lisbon","London",
-      "Los Angeles","Madrid","Malta","Marseille","Mexico City","Naples","Naxos",
-      "Palermo","Phuket","Porto","Queenstown","Rome","Santiago","Seville","Singapore",
-      "Tel Aviv","Tenerife","Thessaloniki","Tokyo","Vienna","Tirana","Washington DC",
-      "San Francisco","Geneva","Kathmandu","Medellin","Bogota","Seoul","Osaka",
-      "Vancouver","Zagreb","Shanghai","Madeira","Nairobi","Paros","Oslo","San Sebastian",
-      "Zurich","Bari","Copenhagen","Sharm El Sheikh","San Diego","Calgary","Boston",
-      "Split","Bilbao","Tromso"
-    ]);
 
     function normalize(text) {
       return (text || '')
@@ -71,7 +71,50 @@
         .trim();
     }
 
-    const CITY_SET = new Set([...MY_CITIES].map(normalize));
+    // Same as normalize, but also drops accents ("Medellín" → "medellin")
+    // so owner names and city names match however they were typed.
+    function fold(text) {
+      return normalize(text).normalize('NFD').replace(/[̀-ͯ]/g, '');
+    }
+
+    // Keeps only the cities owned by MY_OWNER_NAME. Falls back to every city
+    // in the tab if the person isn't in OWNER_BY_EMAIL or owns none, so the
+    // highlighter never silently goes blank.
+    function pickMyCities(rows) {
+      const all = rows.map(r => r.city).filter(Boolean);
+      if (!MY_OWNER_NAME) {
+        console.warn(`[TM] ${AUTHOR_NAME} is not in OWNER_BY_EMAIL, highlighting all ${all.length} cities.`);
+        return all;
+      }
+      const me = fold(MY_OWNER_NAME);
+      const mine = rows.filter(r => fold(r.owner).includes(me)).map(r => r.city);
+      if (!mine.length) {
+        console.warn(`[TM] No cities in em-project with owner "${MY_OWNER_NAME}", highlighting all ${all.length} cities.`);
+        return all;
+      }
+      console.log(`[TM] Highlighting ${mine.length} cities owned by ${MY_OWNER_NAME}.`);
+      return mine;
+    }
+
+    let CITY_SET = new Set();
+    function setCityRows(rows) {
+      CITY_SET = new Set(pickMyCities(rows).map(fold));
+    }
+
+    // Start from the last list we fetched so highlighting is instant, then
+    // refresh from the sheet in the background.
+    const CACHE_KEY = 'emProjectCities';
+    const cached = GM_getValue(CACHE_KEY, null);
+    if (Array.isArray(cached) && cached.length) setCityRows(cached);
+
+    apiRequest('GET', { action: 'cities' })
+      .then((res) => {
+        if (!Array.isArray(res?.cities) || !res.cities.length) return;
+        GM_setValue(CACHE_KEY, res.cities);
+        setCityRows(res.cities);
+        scan();
+      })
+      .catch((err) => console.warn('[TM] Could not load cities from the sheet, using cached list.', err));
 
     function hasUnpaidMarker(cell) {
       const text = visibleText(cell);
@@ -126,7 +169,7 @@
 
         let cityCell = null;
         for (const cell of cells) {
-          if (CITY_SET.has(normalize(visibleText(cell)))) { cityCell = cell; break; }
+          if (CITY_SET.has(fold(visibleText(cell)))) { cityCell = cell; break; }
         }
         if (!cityCell) return;
 
@@ -533,6 +576,122 @@
   }
 
   // ============================================================
+  // PART 3 — DETAIL PAGE: "Copy ride info" button
+  // Reads Date / Time / From / To / Pax / Price (provider cost) from the
+  // linked Welcome Order (green logo link) and copies it to the clipboard.
+  // ============================================================
+  function initRideInfoCopier() {
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const CURRENCY = { EUR: '€', USD: '$', GBP: '£' };
+
+    function readRow(doc, key) {
+      const row = doc.querySelector('tr.row-' + key);
+      if (!row || !row.children[1]) return '';
+      const val = row.children[1].textContent.trim().replace(/\s+/g, ' ');
+      return val === 'Empty' ? '' : val;
+    }
+
+    function extract(doc, duration) {
+      // "October 11, 2026 05:00" -> "11/10/2026" + "05:00"
+      const dt = readRow(doc, 'from_datetime');
+      const m = dt.match(/^(\w+)\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}:\d{2})$/);
+      const pad = (n) => String(n).padStart(2, '0');
+      const date = m && MONTHS.includes(m[1])
+        ? pad(m[2]) + '/' + pad(MONTHS.indexOf(m[1]) + 1) + '/' + m[3]
+        : dt;
+      const time = m ? m[4] : '';
+
+      const cost = readRow(doc, 'provider_cost');
+      const cur = readRow(doc, 'currency_code');
+      const price = cost ? String(parseFloat(cost)) + ' ' + (CURRENCY[cur] || cur || '€') : '';
+
+      return [
+        'Date: ' + date,
+        'Time: ' + time,
+        'Duration: ' + (duration || ''),
+        'From: ' + (readRow(doc, 'from_address') || readRow(doc, 'from_location')),
+        'To: ' + (readRow(doc, 'to_address') || readRow(doc, 'service') || readRow(doc, 'title')),
+        'Pax: ' + readRow(doc, 'number_of_passengers'),
+        'Price ' + price,
+      ].join('\n');
+    }
+
+    // The Accept header is required: without it the CRM redirects background requests to the Dashboard
+    const FETCH_OPTS = { credentials: 'same-origin', headers: { Accept: 'text/html,application/xhtml+xml' } };
+
+    async function getText() {
+      const link = document.querySelector('#page_title a[href*="/admin/welcome_orders/"]');
+      if (!link) throw new Error('Could not find the Welcome Order link on this page.');
+      const res = await fetch(link.href, FETCH_OPTS);
+      if (!res.ok) throw new Error('Could not open the order (HTTP ' + res.status + ')');
+      const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+      if (!doc.querySelector('tr.row-from_datetime')) {
+        throw new Error('The order page did not load correctly (got "' + doc.title + '"). Try reloading the page.');
+      }
+
+      // Duration lives on the Service page (the "Service" link on the order page)
+      let duration = '';
+      const serviceLink = doc.querySelector('tr.row-service a[href]');
+      if (serviceLink) {
+        try {
+          const sRes = await fetch(new URL(serviceLink.getAttribute('href'), location.origin).href, FETCH_OPTS);
+          const sDoc = new DOMParser().parseFromString(await sRes.text(), 'text/html');
+          duration = readRow(sDoc, 'duration');
+        } catch (e) { /* leave duration empty if the service page fails */ }
+      }
+      return extract(doc, duration);
+    }
+
+    function showPanel(text) {
+      let box = document.getElementById('wp-ride-info-box');
+      if (!box) {
+        box = document.createElement('div');
+        box.id = 'wp-ride-info-box';
+        Object.assign(box.style, {
+          position: 'fixed', bottom: '20px', right: '20px', zIndex: 99999,
+          background: '#fff', border: `2px solid ${BRAND.emerald}`, borderRadius: '8px',
+          padding: '12px 14px', fontFamily: BRAND.font, fontSize: '13px', lineHeight: '1.5',
+          color: BRAND.graphite, boxShadow: '0 4px 16px rgba(0,0,0,.15)',
+          maxWidth: '420px', whiteSpace: 'pre-wrap'
+        });
+        document.body.appendChild(box);
+      }
+      box.textContent = text;
+      const foot = document.createElement('div');
+      Object.assign(foot.style, { marginTop: '8px', textAlign: 'right', whiteSpace: 'normal' });
+      foot.innerHTML = `<span style="color:${BRAND.emerald}">✓ copied</span> &nbsp; <a href="#">close</a>`;
+      foot.querySelector('a').onclick = (e) => { e.preventDefault(); box.remove(); };
+      box.appendChild(foot);
+    }
+
+    const pageTitle = document.getElementById('page_title');
+    if (!pageTitle || document.getElementById('wp-ride-info-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'wp-ride-info-btn';
+    btn.type = 'button';
+    btn.textContent = 'Copy ride info';
+    Object.assign(btn.style, {
+      marginLeft: '10px', padding: '4px 10px', background: BRAND.emerald, color: BRAND.graphite,
+      border: 'none', borderRadius: '6px', fontSize: '13px', fontWeight: '700',
+      fontFamily: BRAND.font, cursor: 'pointer', verticalAlign: 'middle'
+    });
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      btn.textContent = 'Loading…';
+      try {
+        const text = await getText();
+        GM_setClipboard(text, 'text');
+        showPanel(text);
+      } catch (err) {
+        alert(err.message);
+      }
+      btn.textContent = 'Copy ride info';
+    });
+    pageTitle.appendChild(btn);
+  }
+
+  // ============================================================
   // ROUTER
   // ============================================================
   const isIndexPage = /tour_transfers\/index_v2/.test(location.href);
@@ -540,5 +699,6 @@
     initIndexHighlighter();
   } else {
     initNotepad();
+    initRideInfoCopier();
   }
 })();

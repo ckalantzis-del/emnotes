@@ -37,6 +37,22 @@ function doGet(e) {
   const action = e.parameter.action;
   const orderId = e.parameter.orderId;
 
+  // Every city in the em-project tab with its owner. The Ops Specialist
+  // script filters this down to the logged-in person's cities.
+  if (action === 'cities') {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(EM_PROJECT_SHEET_NAME);
+    if (!sheet) return jsonResponse({ cities: [] });
+
+    const data = sheet.getDataRange().getValues();
+    const cities = [];
+    for (let i = 0; i < data.length; i++) {
+      const city = String(data[i][EM_PROJECT_CITY_COL] || '').trim();
+      if (!city) continue;
+      cities.push({ city, owner: String(data[i][EM_PROJECT_CITY_OWNER_COL] || '').trim() });
+    }
+    return jsonResponse({ cities });
+  }
+
   if (action === 'cityInfo') {
     const city = String(e.parameter.city || '').trim().toLowerCase();
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(EM_PROJECT_SHEET_NAME);
