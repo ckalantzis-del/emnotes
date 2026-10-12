@@ -11,8 +11,8 @@
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @run-at       document-idle
-// @updateURL    PASTE_RAW_GITHUB_URL_HERE
-// @downloadURL  PASTE_RAW_GITHUB_URL_HERE
+// @updateURL    https://raw.githubusercontent.com/ckalantzis-del/emnotes/main/ops-specialist.user.js
+// @downloadURL  https://raw.githubusercontent.com/ckalantzis-del/emnotes/main/ops-specialist.user.js
 // ==/UserScript==
 
 (function () {
